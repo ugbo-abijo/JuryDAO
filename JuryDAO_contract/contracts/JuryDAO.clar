@@ -1,293 +1,334 @@
-;; title: JuryDAO
+;; title: JusticeDAO
 ;; version: 1.0.0
-;; summary: Decentralized jury selection contract ensuring fair and impartial legal proceedings
-;; description: This contract implements a transparent system for juror registration, qualification verification,
-;; and cryptographic randomization for jury selection in decentralized legal proceedings.
+;; summary: Blockchain jury infrastructure for transparent legal proceedings
 
 ;; constants
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
-(define-constant err-not-registered (err u101))
-(define-constant err-already-registered (err u102))
-(define-constant err-not-qualified (err u103))
-(define-constant err-case-not-found (err u104))
-(define-constant err-case-already-exists (err u105))
-(define-constant err-jury-already-selected (err u106))
-(define-constant err-insufficient-jurors (err u107))
-(define-constant err-invalid-juror-count (err u108))
-(define-constant err-case-closed (err u109))
-
-;; Minimum requirements for juror qualification
-(define-constant min-reputation-score u50)
-(define-constant max-jurors-per-case u12)
+(define-constant err-not-found (err u101))
+(define-constant err-already-exists (err u102))
+(define-constant err-unauthorized (err u103))
+(define-constant err-invalid-status (err u104))
+(define-constant err-already-voted (err u105))
+(define-constant err-case-not-active (err u106))
+(define-constant err-not-juror (err u107))
+(define-constant err-case-closed (err u108))
 
 ;; data vars
-(define-data-var next-case-id uint u1)
-(define-data-var total-registered-jurors uint u0)
-(define-data-var current-case-id uint u0)
+(define-data-var case-nonce uint u0)
+(define-data-var juror-nonce uint u0)
 
-;; data maps
-
-;; Juror registry with qualification data
-(define-map jurors
-    principal
-    {
-        registered-at: uint,
-        reputation-score: uint,
-        cases-served: uint,
-        is-active: bool,
-        specializations: (list 5 (string-ascii 50))
-    }
-)
-
-;; Legal case registry
+;; Case structure
 (define-map cases
-    uint ;; case-id
+    uint
     {
-        case-name: (string-ascii 100),
-        created-by: principal,
+        title: (string-ascii 100),
+        description: (string-utf8 500),
+        plaintiff: principal,
+        defendant: principal,
+        judge: principal,
+        status: (string-ascii 20),
         created-at: uint,
-        required-jurors: uint,
-        jury-selected: bool,
-        is-closed: bool,
-        randomization-seed: (buff 32)
+        verdict: (optional (string-ascii 20)),
+        jury-size: uint,
+        votes-guilty: uint,
+        votes-not-guilty: uint
     }
 )
 
-;; Jury selection results for each case
-(define-map case-juries
-    uint ;; case-id
+;; Juror registry
+(define-map jurors
+    uint
     {
-        jurors: (list 12 principal),
-        selected-at: uint
+        address: principal,
+        name: (string-utf8 100),
+        registered-at: uint,
+        cases-served: uint,
+        active: bool
     }
 )
 
-;; Track which cases a juror is serving on
-(define-map juror-active-cases
-    { juror: principal, case-id: uint }
-    { is-serving: bool }
+;; Juror address to ID mapping
+(define-map juror-addresses
+    principal
+    uint
 )
 
-;; public functions
+;; Case jury assignments
+(define-map case-jurors
+    { case-id: uint, juror-id: uint }
+    {
+        assigned-at: uint,
+        has-voted: bool
+    }
+)
 
-;; Register as a juror with initial qualifications
-(define-public (register-juror (specializations (list 5 (string-ascii 50))))
+;; Individual juror votes
+(define-map juror-votes
+    { case-id: uint, juror-id: uint }
+    {
+        vote: (string-ascii 20),
+        voted-at: uint,
+        notes: (optional (string-utf8 200))
+    }
+)
+
+;; Case evidence documents
+(define-map case-evidence
+    { case-id: uint, evidence-id: uint }
+    {
+        ipfs-hash: (string-ascii 100),
+        submitted-by: principal,
+        submitted-at: uint,
+        description: (string-utf8 200)
+    }
+)
+
+;; Evidence counter per case
+(define-map case-evidence-count
+    uint
+    uint
+)
+
+;; PUBLIC FUNCTIONS
+
+;; Register a new juror
+(define-public (register-juror (name (string-utf8 100)))
     (let
         (
-            (caller tx-sender)
-        )
-        (asserts! (is-none (map-get? jurors caller)) err-already-registered)
-
-        (map-set jurors caller {
-            registered-at: block-height,
-            reputation-score: u50,
-            cases-served: u0,
-            is-active: true,
-            specializations: specializations
-        })
-
-        (var-set total-registered-jurors (+ (var-get total-registered-jurors) u1))
-        (ok true)
-    )
-)
-
-;; Update juror active status
-(define-public (set-juror-status (is-active bool))
-    (let
-        (
-            (caller tx-sender)
-            (juror-data (unwrap! (map-get? jurors caller) err-not-registered))
-        )
-        (ok (map-set jurors caller
-            (merge juror-data { is-active: is-active })
-        ))
-    )
-)
-
-;; Create a new legal case requiring jury selection
-(define-public (create-case
-    (case-name (string-ascii 100))
-    (required-jurors uint)
-    (seed (buff 32))
-)
-    (let
-        (
-            (case-id (var-get next-case-id))
-        )
-        (asserts! (<= required-jurors max-jurors-per-case) err-invalid-juror-count)
-        (asserts! (> required-jurors u0) err-invalid-juror-count)
-        (asserts! (is-none (map-get? cases case-id)) err-case-already-exists)
-
-        (map-set cases case-id {
-            case-name: case-name,
-            created-by: tx-sender,
-            created-at: block-height,
-            required-jurors: required-jurors,
-            jury-selected: false,
-            is-closed: false,
-            randomization-seed: seed
-        })
-
-        (var-set next-case-id (+ case-id u1))
-        (ok case-id)
-    )
-)
-
-;; Select jury for a case using cryptographic randomization
-(define-public (select-jury (case-id uint))
-    (let
-        (
-            (case-data (unwrap! (map-get? cases case-id) err-case-not-found))
-            (required-count (get required-jurors case-data))
-        )
-        (asserts! (not (get jury-selected case-data)) err-jury-already-selected)
-        (asserts! (not (get is-closed case-data)) err-case-closed)
-        (asserts! (>= (var-get total-registered-jurors) required-count) err-insufficient-jurors)
-
-        ;; In a real implementation, this would use VRF (Verifiable Random Function)
-        ;; For this version, we'll mark as selected and allow external randomization
-        (map-set cases case-id
-            (merge case-data { jury-selected: true })
-        )
-
-        (ok true)
-    )
-)
-
-;; Assign selected jurors to a case (called after randomization)
-(define-public (assign-jurors (case-id uint) (selected-jurors (list 12 principal)))
-    (let
-        (
-            (case-data (unwrap! (map-get? cases case-id) err-case-not-found))
+            (juror-id (+ (var-get juror-nonce) u1))
             (caller tx-sender)
         )
         (begin
-            (asserts! (is-eq caller (get created-by case-data)) err-owner-only)
-            (asserts! (get jury-selected case-data) err-jury-already-selected)
-            (asserts! (not (get is-closed case-data)) err-case-closed)
-
-            ;; Verify all selected jurors are qualified
-            (asserts! (fold verify-juror-qualified selected-jurors true) err-not-qualified)
-
-            ;; Store jury selection
-            (map-set case-juries case-id {
-                jurors: selected-jurors,
-                selected-at: block-height
+            (asserts! (is-none (map-get? juror-addresses caller)) err-already-exists)
+            (map-set jurors juror-id {
+                address: caller,
+                name: name,
+                registered-at: stacks-block-height,
+                cases-served: u0,
+                active: true
             })
-
-            ;; Mark jurors as serving
-            (begin
-                (fold (lambda (juror prev) (mark-juror-serving case-id juror prev))
-                      selected-jurors
-                      true)
-                (ok true)
-            )
+            (map-set juror-addresses caller juror-id)
+            (var-set juror-nonce juror-id)
+            (ok juror-id)
         )
     )
 )
 
-;; Update juror reputation after case completion (only case creator)
-(define-public (update-juror-reputation (juror principal) (case-id uint) (new-score uint))
+;; Create a new case
+(define-public (create-case
+    (title (string-ascii 100))
+    (description (string-utf8 500))
+    (defendant principal)
+    (jury-size uint)
+)
     (let
         (
-            (case-data (unwrap! (map-get? cases case-id) err-case-not-found))
-            (juror-data (unwrap! (map-get? jurors juror) err-not-registered))
+            (case-id (+ (var-get case-nonce) u1))
+            (caller tx-sender)
         )
-        (asserts! (is-eq tx-sender (get created-by case-data)) err-owner-only)
+        (begin
+            (map-set cases case-id {
+                title: title,
+                description: description,
+                plaintiff: caller,
+                defendant: defendant,
+                judge: caller,
+                status: "pending",
+                created-at: stacks-block-height,
+                verdict: none,
+                jury-size: jury-size,
+                votes-guilty: u0,
+                votes-not-guilty: u0
+            })
+            (map-set case-evidence-count case-id u0)
+            (var-set case-nonce case-id)
+            (ok case-id)
+        )
+    )
+)
 
-        (ok (map-set jurors juror
-            (merge juror-data {
-                reputation-score: new-score,
+;; Assign juror to case
+(define-public (assign-juror (case-id uint) (juror-id uint))
+    (let
+        (
+            (case-data (unwrap! (map-get? cases case-id) err-not-found))
+            (juror-data (unwrap! (map-get? jurors juror-id) err-not-found))
+        )
+        (begin
+            (asserts! (is-eq tx-sender (get judge case-data)) err-unauthorized)
+            (asserts! (is-eq (get status case-data) "pending") err-invalid-status)
+            (asserts! (get active juror-data) err-unauthorized)
+            (map-set case-jurors { case-id: case-id, juror-id: juror-id } {
+                assigned-at: stacks-block-height,
+                has-voted: false
+            })
+            (map-set jurors juror-id (merge juror-data {
                 cases-served: (+ (get cases-served juror-data) u1)
-            })
-        ))
+            }))
+            (ok true)
+        )
     )
 )
 
-;; Close a case
-(define-public (close-case (case-id uint))
+;; Start case proceedings
+(define-public (start-case (case-id uint))
     (let
         (
-            (case-data (unwrap! (map-get? cases case-id) err-case-not-found))
+            (case-data (unwrap! (map-get? cases case-id) err-not-found))
         )
-        (asserts! (is-eq tx-sender (get created-by case-data)) err-owner-only)
-        (asserts! (not (get is-closed case-data)) err-case-closed)
-
-        (ok (map-set cases case-id
-            (merge case-data { is-closed: true })
-        ))
+        (begin
+            (asserts! (is-eq tx-sender (get judge case-data)) err-unauthorized)
+            (asserts! (is-eq (get status case-data) "pending") err-invalid-status)
+            (map-set cases case-id (merge case-data {
+                status: "active"
+            }))
+            (ok true)
+        )
     )
 )
 
-;; read only functions
-
-;; Get juror information
-(define-read-only (get-juror (juror principal))
-    (ok (map-get? jurors juror))
+;; Submit evidence
+(define-public (submit-evidence
+    (case-id uint)
+    (ipfs-hash (string-ascii 100))
+    (description (string-utf8 200))
+)
+    (let
+        (
+            (case-data (unwrap! (map-get? cases case-id) err-not-found))
+            (evidence-count (default-to u0 (map-get? case-evidence-count case-id)))
+            (evidence-id (+ evidence-count u1))
+        )
+        (begin
+            (asserts! (is-eq (get status case-data) "active") err-case-not-active)
+            (map-set case-evidence { case-id: case-id, evidence-id: evidence-id } {
+                ipfs-hash: ipfs-hash,
+                submitted-by: tx-sender,
+                submitted-at: stacks-block-height,
+                description: description
+            })
+            (map-set case-evidence-count case-id evidence-id)
+            (ok evidence-id)
+        )
+    )
 )
 
-;; Get case information
+;; Cast vote (juror only)
+(define-public (cast-vote
+    (case-id uint)
+    (vote (string-ascii 20))
+    (notes (optional (string-utf8 200)))
+)
+    (let
+        (
+            (case-data (unwrap! (map-get? cases case-id) err-not-found))
+            (juror-id (unwrap! (map-get? juror-addresses tx-sender) err-not-juror))
+            (assignment (unwrap! (map-get? case-jurors { case-id: case-id, juror-id: juror-id }) err-not-juror))
+        )
+        (begin
+            (asserts! (is-eq (get status case-data) "active") err-case-not-active)
+            (asserts! (not (get has-voted assignment)) err-already-voted)
+            (map-set juror-votes { case-id: case-id, juror-id: juror-id } {
+                vote: vote,
+                voted-at: stacks-block-height,
+                notes: notes
+            })
+            (map-set case-jurors { case-id: case-id, juror-id: juror-id } (merge assignment {
+                has-voted: true
+            }))
+            (if (is-eq vote "guilty")
+                (map-set cases case-id (merge case-data {
+                    votes-guilty: (+ (get votes-guilty case-data) u1)
+                }))
+                (map-set cases case-id (merge case-data {
+                    votes-not-guilty: (+ (get votes-not-guilty case-data) u1)
+                }))
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Close case and record verdict
+(define-public (close-case (case-id uint) (verdict (string-ascii 20)))
+    (let
+        (
+            (case-data (unwrap! (map-get? cases case-id) err-not-found))
+        )
+        (begin
+            (asserts! (is-eq tx-sender (get judge case-data)) err-unauthorized)
+            (asserts! (is-eq (get status case-data) "active") err-case-not-active)
+            (map-set cases case-id (merge case-data {
+                status: "closed",
+                verdict: (some verdict)
+            }))
+            (ok true)
+        )
+    )
+)
+
+;; Deactivate juror
+(define-public (deactivate-juror (juror-id uint))
+    (let
+        (
+            (juror-data (unwrap! (map-get? jurors juror-id) err-not-found))
+        )
+        (begin
+            (asserts! (is-eq tx-sender (get address juror-data)) err-unauthorized)
+            (map-set jurors juror-id (merge juror-data {
+                active: false
+            }))
+            (ok true)
+        )
+    )
+)
+
+;; READ-ONLY FUNCTIONS
+
 (define-read-only (get-case (case-id uint))
     (ok (map-get? cases case-id))
 )
 
-;; Get jury for a case
-(define-read-only (get-case-jury (case-id uint))
-    (ok (map-get? case-juries case-id))
+(define-read-only (get-juror (juror-id uint))
+    (ok (map-get? jurors juror-id))
 )
 
-;; Check if juror is qualified
-(define-read-only (is-juror-qualified (juror principal))
-    (match (map-get? jurors juror)
-        juror-data (ok (and
-            (get is-active juror-data)
-            (>= (get reputation-score juror-data) min-reputation-score)
-        ))
-        (ok false)
-    )
+(define-read-only (get-juror-id (address principal))
+    (ok (map-get? juror-addresses address))
 )
 
-;; Get total registered jurors
-(define-read-only (get-total-jurors)
-    (ok (var-get total-registered-jurors))
+(define-read-only (get-case-juror (case-id uint) (juror-id uint))
+    (ok (map-get? case-jurors { case-id: case-id, juror-id: juror-id }))
 )
 
-;; Get next case ID
-(define-read-only (get-next-case-id)
-    (ok (var-get next-case-id))
+(define-read-only (get-juror-vote (case-id uint) (juror-id uint))
+    (ok (map-get? juror-votes { case-id: case-id, juror-id: juror-id }))
 )
 
-;; Check if juror is serving on a case
-(define-read-only (is-serving-on-case (juror principal) (case-id uint))
-    (ok (default-to false
-        (get is-serving (map-get? juror-active-cases { juror: juror, case-id: case-id }))
-    ))
+(define-read-only (get-evidence (case-id uint) (evidence-id uint))
+    (ok (map-get? case-evidence { case-id: case-id, evidence-id: evidence-id }))
 )
 
-;; private functions
-
-;; Verify a single juror is qualified
-(define-private (verify-juror-qualified (juror principal) (prev-result bool))
-    (if prev-result
-        (match (map-get? jurors juror)
-            juror-data (and
-                (get is-active juror-data)
-                (>= (get reputation-score juror-data) min-reputation-score)
-            )
-            false
-        )
-        false
-    )
+(define-read-only (get-evidence-count (case-id uint))
+    (ok (default-to u0 (map-get? case-evidence-count case-id)))
 )
 
-;; Mark a juror as serving on a case
-(define-private (mark-juror-serving (case-id uint) (juror principal) (prev-result bool))
-    (begin
-        (map-set juror-active-cases
-            { juror: juror, case-id: case-id }
-            { is-serving: true }
-        )
-        prev-result
+(define-read-only (get-case-nonce)
+    (ok (var-get case-nonce))
+)
+
+(define-read-only (get-juror-nonce)
+    (ok (var-get juror-nonce))
+)
+
+(define-read-only (get-vote-tally (case-id uint))
+    (match (map-get? cases case-id)
+        case-data (ok {
+            guilty: (get votes-guilty case-data),
+            not-guilty: (get votes-not-guilty case-data),
+            total: (+ (get votes-guilty case-data) (get votes-not-guilty case-data))
+        })
+        err-not-found
     )
 )
